@@ -121,20 +121,29 @@ jobs:
           fi
 
           # -------------------------------------------------------
-          # Find the last existing subtask under TARGET_TASK_ID so
-          # we can reposition our new review task at the bottom
-          # after creation. Limited to Asana's max page size of 100.
+          # Fetch existing subtasks under TARGET_TASK_ID. We use the
+          # result for two things:
+          #   1. Deduplication: if a subtask already references this
+          #      PR URL, skip creation so retried/re-run workflows
+          #      (or a prior partially-failed POST) don't duplicate.
+          #   2. Positioning: remember the last sibling so we can move
+          #      the new subtask to the bottom after creation.
+          # Limited to Asana's max page size of 100.
           # -------------------------------------------------------
           LAST_SIBLING_GID=""
+          EXISTING_SUBTASK_GID=""
           SIBLINGS_HTTP=$(curl -s -o /tmp/asana_siblings.json -w "%{http_code}" \
             --connect-timeout 10 --max-time 30 \
             --retry 3 --retry-delay 2 --retry-connrefused \
-            "https://app.asana.com/api/1.0/tasks/${TARGET_TASK_ID}/subtasks?opt_fields=gid&limit=100" \
+            "https://app.asana.com/api/1.0/tasks/${TARGET_TASK_ID}/subtasks?opt_fields=gid,notes&limit=100" \
             -H "Authorization: Bearer $ASANA_TOKEN" \
             || true)
 
           if [ "$SIBLINGS_HTTP" = "200" ]; then
             LAST_SIBLING_GID=$(jq -r '(.data // []) | last | .gid // ""' /tmp/asana_siblings.json)
+            EXISTING_SUBTASK_GID=$(jq -r --arg url "$PR_URL" \
+              '(.data // []) | map(select((.notes // "") | contains($url))) | first | .gid // ""' \
+              /tmp/asana_siblings.json)
             if [ -n "$LAST_SIBLING_GID" ]; then
               echo "📌 Will insert new subtask after sibling: $LAST_SIBLING_GID"
             else
@@ -142,6 +151,12 @@ jobs:
             fi
           else
             echo "⚠️  Could not fetch existing subtasks (HTTP $SIBLINGS_HTTP). New task will remain at the top."
+          fi
+
+          if [ -n "$EXISTING_SUBTASK_GID" ]; then
+            EXISTING_SUBTASK_URL="https://app.asana.com/0/0/${EXISTING_SUBTASK_GID}"
+            echo "ℹ️  An existing review subtask for this PR was found: $EXISTING_SUBTASK_URL. Skipping creation."
+            exit 0
           fi
 
           # -------------------------------------------------------
@@ -168,13 +183,13 @@ jobs:
 
           # -------------------------------------------------------
           # Create the subtask.
-          # Retries on POST carry a small duplicate-subtask risk if
-          # a network timeout occurs after the request reached Asana;
-          # acceptable given no idempotency-key support in the API.
+          # No curl retries here: the Asana create-subtask endpoint
+          # has no idempotency-key support, so a retry after a
+          # timed-out-but-delivered request would create duplicates.
+          # Deduplication above guards against re-runs instead.
           # -------------------------------------------------------
           RESPONSE=$(curl -s -o /tmp/asana_response.json -w "%{http_code}" \
             --connect-timeout 10 --max-time 30 \
-            --retry 2 --retry-delay 2 --retry-connrefused \
             -X POST "https://app.asana.com/api/1.0/tasks/${TARGET_TASK_ID}/subtasks" \
             -H "Authorization: Bearer $ASANA_TOKEN" \
             -H "Content-Type: application/json" \
