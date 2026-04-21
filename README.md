@@ -49,7 +49,11 @@ The workflow expects a JSON object mapping GitHub usernames to Asana user GIDs.
 3. Name: `ASANA_USER_MAP`
 4. Value (example):
    ```json
-   {"octocat":"1234567890123456","hubot":"6543210987654321","kelseymcauley":"15944996466906"}
+   {
+     "octocat": "1234567890123456",
+     "hubot": "6543210987654321",
+     "kelseymcauley": "15944996466906"
+   }
    ```
 5. Scope it to the repos that will use this workflow.
 
@@ -109,6 +113,9 @@ on:
 jobs:
   create-task:
     uses: Raborn-Digital/Asana-PR-Review-Task/.github/workflows/asana-review-task.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
     with:
       user-map: ${{ vars.ASANA_USER_MAP }}
       workload-field-gid: ${{ vars.ASANA_WORKLOAD_FIELD_GID }}
@@ -122,18 +129,18 @@ That's it. Open a PR, request a review, and the workflow handles the rest.
 
 ## Inputs
 
-| Input | Required | Default | Description |
-|---|---|---|---|
-| `user-map` | Yes | — | JSON object mapping GitHub usernames to Asana user GIDs. Typically `${{ vars.ASANA_USER_MAP }}`. |
-| `workload-field-gid` | No | `''` | Asana custom field GID for "Workload Estimate". Leave empty to skip. |
-| `workload-value` | No | `1` | Numeric value to set for the Workload Estimate custom field. |
-| `due-date-timezone` | No | `America/New_York` | IANA timezone name used to compute "today" for the due date. |
+| Input                | Required | Default            | Description                                                                                      |
+| -------------------- | -------- | ------------------ | ------------------------------------------------------------------------------------------------ |
+| `user-map`           | Yes      | —                  | JSON object mapping GitHub usernames to Asana user GIDs. Typically `${{ vars.ASANA_USER_MAP }}`. |
+| `workload-field-gid` | No       | `''`               | Asana custom field GID for "Workload Estimate". Leave empty to skip.                             |
+| `workload-value`     | No       | `1`                | Numeric value to set for the Workload Estimate custom field.                                     |
+| `due-date-timezone`  | No       | `America/New_York` | IANA timezone name used to compute "today" for the due date.                                     |
 
 ## Secrets
 
-| Secret | Required | Description |
-|---|---|---|
-| `ASANA_PAT` | Yes | Asana Personal Access Token with access to the target workspace. |
+| Secret      | Required | Description                                                      |
+| ----------- | -------- | ---------------------------------------------------------------- |
+| `ASANA_PAT` | Yes      | Asana Personal Access Token with access to the target workspace. |
 
 ---
 
@@ -160,6 +167,7 @@ If no Asana URL is found in the PR body, the workflow exits cleanly (status 0) �
 The reusable workflow declares the permissions it needs on the job it runs in. However, because this is called via `workflow_call`, the **calling workflow's** token permissions still apply as the ceiling. Verify this setting in every consuming repo (or at the organization level):
 
 **Settings → Actions → General → Workflow permissions** set to either:
+
 - **Read and write permissions**, or
 - **Read repository contents and packages permissions** (the restrictive default — works because the reusable workflow declares `pull-requests: write` on its job).
 
@@ -172,6 +180,7 @@ If your org enforces a read-only policy, `gh pr comment` will 403 and the commen
 This workflow lives in a public repository (`Raborn-Digital/Asana-PR-Review-Task`), which means **any organization or user on GitHub can call it** from their own workflows, regardless of plan level. No cross-org sharing configuration is needed.
 
 Each consuming org sets up its own:
+
 - `ASANA_PAT` secret
 - `ASANA_USER_MAP` variable
 - `ASANA_WORKLOAD_FIELD_GID` variable
