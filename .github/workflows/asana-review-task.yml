@@ -1,0 +1,221 @@
+name: Create Asana Review Task
+
+on:
+  workflow_call:
+    inputs:
+      user-map:
+        description: JSON object mapping GitHub usernames to Asana user GIDs (e.g. {"octocat":"123..."}).
+        required: true
+        type: string
+      workload-field-gid:
+        description: Asana custom field GID for "Workload Estimate". Omit or leave empty to skip setting the field.
+        required: false
+        type: string
+        default: ''
+      workload-value:
+        description: Numeric value to set for the Workload Estimate custom field.
+        required: false
+        type: number
+        default: 1
+      due-date-timezone:
+        description: IANA timezone name used to compute "today" for the due date.
+        required: false
+        type: string
+        default: America/New_York
+    secrets:
+      ASANA_PAT:
+        description: Asana Personal Access Token with access to the target workspace.
+        required: true
+
+jobs:
+  create-review-task:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Create Asana Review Subtask
+        env:
+          ASANA_TOKEN: ${{ secrets.ASANA_PAT }}
+          GH_TOKEN: ${{ github.token }}
+          USER_MAP_JSON: ${{ inputs.user-map }}
+          WORKLOAD_FIELD_GID: ${{ inputs.workload-field-gid }}
+          WORKLOAD_VALUE: ${{ inputs.workload-value }}
+          DUE_DATE_TZ: ${{ inputs.due-date-timezone }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO: ${{ github.repository }}
+          REVIEWER: ${{ github.event.requested_reviewer.login }}
+        run: |
+          # -------------------------------------------------------
+          # Resolve Asana user ID for the requested reviewer.
+          # The user map arrives as a JSON string input.
+          # -------------------------------------------------------
+          if [ -z "$USER_MAP_JSON" ]; then
+            echo "⚠️  user-map input is empty. Task will be created unassigned."
+            ASANA_ASSIGNEE=""
+          elif [ -z "$REVIEWER" ]; then
+            echo "ℹ️  No individual reviewer on this event (likely a team review request). Task will be unassigned."
+            ASANA_ASSIGNEE=""
+          else
+            ASANA_ASSIGNEE=$(printf '%s' "$USER_MAP_JSON" \
+              | jq -r --arg user "$REVIEWER" '.[$user] // ""' \
+              || true)
+          fi
+
+          if [ -z "$ASANA_ASSIGNEE" ]; then
+            echo "⚠️  No Asana user ID mapped for GitHub user '$REVIEWER'. Task will be created unassigned."
+          else
+            echo "✅ Mapped '$REVIEWER' to Asana user ID: $ASANA_ASSIGNEE"
+          fi
+
+          # -------------------------------------------------------
+          # Extract Asana task ID from the PR body.
+          # Supports all current Asana URL formats:
+          #   Legacy:  https://app.asana.com/0/{project_id}/{task_id}
+          #            https://app.asana.com/0/{project_id}/{task_id}/f
+          #   New:     https://app.asana.com/1/{workspace}/project/{project_id}/task/{task_id}
+          # -------------------------------------------------------
+          ASANA_TASK_ID=$(printf '%s' "$PR_BODY" \
+            | grep -oP 'https://app\.asana\.com/\d+/\d+/(?:project/\d+/task/)?\K\d+' \
+            | head -n1 \
+            || true)
+
+          if [ -z "$ASANA_TASK_ID" ]; then
+            echo "❌ No Asana task link found in PR body. Skipping."
+            exit 0
+          fi
+
+          echo "📋 Found Asana task ID: $ASANA_TASK_ID"
+
+          # -------------------------------------------------------
+          # Resolve the linked task's parent (if any).
+          # Review subtasks are placed under the parent so they
+          # live alongside the original work item instead of
+          # nesting inside an existing subtask.
+          # -------------------------------------------------------
+          TARGET_TASK_ID="$ASANA_TASK_ID"
+          PARENT_HTTP=$(curl -s -o /tmp/asana_parent.json -w "%{http_code}" \
+            --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 2 --retry-connrefused \
+            "https://app.asana.com/api/1.0/tasks/${ASANA_TASK_ID}?opt_fields=parent.gid,parent.name" \
+            -H "Authorization: Bearer $ASANA_TOKEN" \
+            || true)
+
+          if [ "$PARENT_HTTP" = "200" ]; then
+            PARENT_GID=$(jq -r '.data.parent.gid // ""' /tmp/asana_parent.json)
+            PARENT_NAME=$(jq -r '.data.parent.name // ""' /tmp/asana_parent.json)
+            if [ -n "$PARENT_GID" ]; then
+              TARGET_TASK_ID="$PARENT_GID"
+              echo "⬆️  Linked task has parent \"$PARENT_NAME\" ($PARENT_GID). Creating subtask under parent."
+            else
+              echo "ℹ️  Linked task has no parent. Creating subtask under the linked task."
+            fi
+          else
+            echo "⚠️  Parent lookup failed (HTTP $PARENT_HTTP). Falling back to linked task."
+            cat /tmp/asana_parent.json
+          fi
+
+          # -------------------------------------------------------
+          # Find the last existing subtask under TARGET_TASK_ID so
+          # we can reposition our new review task at the bottom
+          # after creation. Limited to Asana's max page size of 100.
+          # -------------------------------------------------------
+          LAST_SIBLING_GID=""
+          SIBLINGS_HTTP=$(curl -s -o /tmp/asana_siblings.json -w "%{http_code}" \
+            --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 2 --retry-connrefused \
+            "https://app.asana.com/api/1.0/tasks/${TARGET_TASK_ID}/subtasks?opt_fields=gid&limit=100" \
+            -H "Authorization: Bearer $ASANA_TOKEN" \
+            || true)
+
+          if [ "$SIBLINGS_HTTP" = "200" ]; then
+            LAST_SIBLING_GID=$(jq -r '(.data // []) | last | .gid // ""' /tmp/asana_siblings.json)
+            if [ -n "$LAST_SIBLING_GID" ]; then
+              echo "📌 Will insert new subtask after sibling: $LAST_SIBLING_GID"
+            else
+              echo "ℹ️  No existing subtasks; new task will be the only one."
+            fi
+          else
+            echo "⚠️  Could not fetch existing subtasks (HTTP $SIBLINGS_HTTP). New task will remain at the top."
+          fi
+
+          # -------------------------------------------------------
+          # Build the Asana API payload.
+          # -------------------------------------------------------
+          NOTES=$(printf 'Review requested by @%s\n\nPR: %s' "$PR_AUTHOR" "$PR_URL")
+
+          DUE_ON=$(TZ="$DUE_DATE_TZ" date +%Y-%m-%d)
+          echo "📅 Due date: $DUE_ON (timezone: $DUE_DATE_TZ)"
+
+          PAYLOAD=$(jq -n \
+            --arg name "Review PR: $PR_TITLE" \
+            --arg notes "$NOTES" \
+            --arg due_on "$DUE_ON" \
+            --arg assignee "$ASANA_ASSIGNEE" \
+            --arg workload_field "$WORKLOAD_FIELD_GID" \
+            --argjson workload_value "$WORKLOAD_VALUE" \
+            '{data: ({name: $name, notes: $notes, due_on: $due_on}
+                     + (if $assignee == "" then {} else {assignee: $assignee} end)
+                     + (if $workload_field == ""
+                        then {}
+                        else {custom_fields: {($workload_field): $workload_value}}
+                        end))}')
+
+          # -------------------------------------------------------
+          # Create the subtask.
+          # Retries on POST carry a small duplicate-subtask risk if
+          # a network timeout occurs after the request reached Asana;
+          # acceptable given no idempotency-key support in the API.
+          # -------------------------------------------------------
+          RESPONSE=$(curl -s -o /tmp/asana_response.json -w "%{http_code}" \
+            --connect-timeout 10 --max-time 30 \
+            --retry 2 --retry-delay 2 --retry-connrefused \
+            -X POST "https://app.asana.com/api/1.0/tasks/${TARGET_TASK_ID}/subtasks" \
+            -H "Authorization: Bearer $ASANA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          if [ "$RESPONSE" -eq 201 ]; then
+            SUBTASK_ID=$(jq -r '.data.gid' /tmp/asana_response.json)
+            SUBTASK_URL="https://app.asana.com/0/0/${SUBTASK_ID}"
+            echo "✅ Subtask created: $SUBTASK_URL"
+
+            # Reposition to the bottom of the subtask list.
+            if [ -n "$LAST_SIBLING_GID" ]; then
+              REPOSITION_PAYLOAD=$(jq -n \
+                --arg parent "$TARGET_TASK_ID" \
+                --arg insert_after "$LAST_SIBLING_GID" \
+                '{data: {parent: $parent, insert_after: $insert_after}}')
+
+              REPOSITION_HTTP=$(curl -s -o /tmp/asana_reposition.json -w "%{http_code}" \
+                --connect-timeout 10 --max-time 30 \
+                --retry 2 --retry-delay 2 --retry-connrefused \
+                -X POST "https://app.asana.com/api/1.0/tasks/${SUBTASK_ID}/setParent" \
+                -H "Authorization: Bearer $ASANA_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$REPOSITION_PAYLOAD" \
+                || true)
+
+              if [ "$REPOSITION_HTTP" = "200" ]; then
+                echo "⬇️  Moved subtask to the end of the list."
+              else
+                echo "⚠️  Failed to reposition subtask (HTTP $REPOSITION_HTTP). It will stay at the top."
+                cat /tmp/asana_reposition.json
+              fi
+            fi
+
+            # Post a comment on the PR linking to the Asana review task.
+            COMMENT_BODY=$(printf '🗂️ Asana review task created: %s' "$SUBTASK_URL")
+            if ! gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$COMMENT_BODY"; then
+              echo "⚠️  Failed to post PR comment (subtask was still created)."
+            fi
+          else
+            echo "❌ Failed to create subtask. HTTP status: $RESPONSE"
+            cat /tmp/asana_response.json
+            exit 1
+          fi
