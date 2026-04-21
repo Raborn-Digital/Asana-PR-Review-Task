@@ -17,6 +17,16 @@ on:
         required: false
         type: number
         default: 1
+      task-status-field-gid:
+        description: Asana custom field GID for the "Task Status" enum field. Omit or leave empty to skip setting the field.
+        required: false
+        type: string
+        default: ''
+      task-status-value-gid:
+        description: Asana enum option GID to set for the Task Status field (e.g. the GID of "Ready to Work On").
+        required: false
+        type: string
+        default: ''
       due-date-timezone:
         description: IANA timezone name used to compute "today" for the due date.
         required: false
@@ -42,6 +52,8 @@ jobs:
           USER_MAP_JSON: ${{ inputs.user-map }}
           WORKLOAD_FIELD_GID: ${{ inputs.workload-field-gid }}
           WORKLOAD_VALUE: ${{ inputs.workload-value }}
+          TASK_STATUS_FIELD_GID: ${{ inputs.task-status-field-gid }}
+          TASK_STATUS_VALUE_GID: ${{ inputs.task-status-value-gid }}
           DUE_DATE_TZ: ${{ inputs.due-date-timezone }}
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -174,12 +186,19 @@ jobs:
             --arg assignee "$ASANA_ASSIGNEE" \
             --arg workload_field "$WORKLOAD_FIELD_GID" \
             --argjson workload_value "$WORKLOAD_VALUE" \
-            '{data: ({name: $name, notes: $notes, due_on: $due_on}
-                     + (if $assignee == "" then {} else {assignee: $assignee} end)
-                     + (if $workload_field == ""
-                        then {}
-                        else {custom_fields: {($workload_field): $workload_value}}
-                        end))}')
+            --arg status_field "$TASK_STATUS_FIELD_GID" \
+            --arg status_value "$TASK_STATUS_VALUE_GID" \
+            '
+            ($workload_field | if . == "" then {} else {(.): $workload_value} end) as $workload_cf
+            | (if $status_field != "" and $status_value != ""
+               then {($status_field): $status_value}
+               else {}
+               end) as $status_cf
+            | ($workload_cf + $status_cf) as $cfs
+            | {data: ({name: $name, notes: $notes, due_on: $due_on}
+                      + (if $assignee == "" then {} else {assignee: $assignee} end)
+                      + (if ($cfs | length) == 0 then {} else {custom_fields: $cfs} end))}
+            ')
 
           # -------------------------------------------------------
           # Create the subtask.

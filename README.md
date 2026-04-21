@@ -1,6 +1,6 @@
 # Asana PR Review Task
 
-A reusable GitHub Actions workflow that automatically creates an Asana review subtask whenever a reviewer is requested on a pull request, assigns it, sets a due date, fills a custom "Workload Estimate" field, and drops a link to it as a PR comment.
+A reusable GitHub Actions workflow that automatically creates an Asana review subtask whenever a reviewer is requested on a pull request, assigns it, sets a due date, fills custom fields (e.g. "Workload Estimate" and "Task Status"), and drops a link to it as a PR comment.
 
 Designed to be called from any repository across any number of GitHub organizations via `workflow_call`, with per-org configuration stored as organization variables and secrets.
 
@@ -12,7 +12,8 @@ Designed to be called from any repository across any number of GitHub organizati
 - Resolves the linked task's parent so review tasks live alongside the original work item instead of nesting inside an existing subtask.
 - Assigns the review subtask to a GitHub reviewer via a GitHub username → Asana user GID map.
 - Sets a due date for today (configurable timezone).
-- Fills an Asana custom field (e.g. "Workload Estimate") with a configurable numeric value.
+- Fills an Asana number custom field (e.g. "Workload Estimate") with a configurable numeric value.
+- Fills an Asana enum (single-select) custom field (e.g. "Task Status") with a configurable option (e.g. "Ready to Work On").
 - Repositions the new subtask at the bottom of the parent's subtask list (Asana defaults to top).
 - Posts a PR comment linking to the new Asana task.
 - All calls use bounded timeouts and conservative retries; transient failures fall back gracefully without blocking the workflow.
@@ -99,7 +100,55 @@ Expected output (if it's a number field):
 
 If `resource_subtype` is not `"number"`, see [Limitations](#limitations) below.
 
-### 5. Add the caller workflow to each consuming repo
+### 5. Add the Task Status field and value GIDs as organization variables (optional)
+
+If you want the workflow to populate a "Task Status" enum (single-select) custom field — for example, setting every new review task to "Ready to Work On":
+
+1. Variables tab → **New organization variable**.
+2. Name: `ASANA_TASK_STATUS_FIELD_GID`
+3. Value: the numeric GID of the enum custom field.
+4. Add a second variable for the enum option GID:
+   - Name: `ASANA_TASK_STATUS_VALUE_GID`
+   - Value: the GID of the specific option you want set (e.g. the one named "Ready to Work On").
+
+#### How to find the Task Status field and option GIDs
+
+Find the field GID:
+
+```bash
+curl -s -H "Authorization: Bearer $ASANA_PAT" \
+  "https://app.asana.com/api/1.0/tasks/<any_task_id>?opt_fields=custom_fields.gid,custom_fields.name,custom_fields.resource_subtype" \
+  | jq '.data.custom_fields[] | select(.name == "Task Status")'
+```
+
+Expected output (for an enum field):
+
+```json
+{
+  "gid": "1202770811510553",
+  "name": "Task Status",
+  "resource_subtype": "enum"
+}
+```
+
+Then find the enum option GID:
+
+```bash
+curl -s -H "Authorization: Bearer $ASANA_PAT" \
+  "https://app.asana.com/api/1.0/custom_fields/<field_gid>?opt_fields=enum_options.gid,enum_options.name" \
+  | jq '.data.enum_options[] | select(.name == "Ready to Work On")'
+```
+
+Expected output:
+
+```json
+{
+  "gid": "1202770811510586",
+  "name": "Ready to Work On"
+}
+```
+
+### 6. Add the caller workflow to each consuming repo
 
 Create `.github/workflows/asana-review-task.yml` in each repo that needs the automation:
 
@@ -119,6 +168,8 @@ jobs:
     with:
       user-map: ${{ vars.ASANA_USER_MAP }}
       workload-field-gid: ${{ vars.ASANA_WORKLOAD_FIELD_GID }}
+      task-status-field-gid: ${{ vars.ASANA_TASK_STATUS_FIELD_GID }}
+      task-status-value-gid: ${{ vars.ASANA_TASK_STATUS_VALUE_GID }}
     secrets:
       ASANA_PAT: ${{ secrets.ASANA_PAT }}
 ```
@@ -129,12 +180,14 @@ That's it. Open a PR, request a review, and the workflow handles the rest.
 
 ## Inputs
 
-| Input                | Required | Default            | Description                                                                                      |
-| -------------------- | -------- | ------------------ | ------------------------------------------------------------------------------------------------ |
-| `user-map`           | Yes      | —                  | JSON object mapping GitHub usernames to Asana user GIDs. Typically `${{ vars.ASANA_USER_MAP }}`. |
-| `workload-field-gid` | No       | `''`               | Asana custom field GID for "Workload Estimate". Leave empty to skip.                             |
-| `workload-value`     | No       | `1`                | Numeric value to set for the Workload Estimate custom field.                                     |
-| `due-date-timezone`  | No       | `America/New_York` | IANA timezone name used to compute "today" for the due date.                                     |
+| Input                   | Required | Default            | Description                                                                                                    |
+| ----------------------- | -------- | ------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `user-map`              | Yes      | —                  | JSON object mapping GitHub usernames to Asana user GIDs. Typically `${{ vars.ASANA_USER_MAP }}`.               |
+| `workload-field-gid`    | No       | `''`               | Asana custom field GID for "Workload Estimate" (number field). Leave empty to skip.                            |
+| `workload-value`        | No       | `1`                | Numeric value to set for the Workload Estimate custom field.                                                   |
+| `task-status-field-gid` | No       | `''`               | Asana custom field GID for "Task Status" (enum / single-select field). Leave empty to skip.                    |
+| `task-status-value-gid` | No       | `''`               | Asana enum option GID to set for the Task Status field (e.g. the GID of the "Ready to Work On" option).        |
+| `due-date-timezone`     | No       | `America/New_York` | IANA timezone name used to compute "today" for the due date.                                                   |
 
 ## Secrets
 
@@ -183,7 +236,8 @@ Each consuming org sets up its own:
 
 - `ASANA_PAT` secret
 - `ASANA_USER_MAP` variable
-- `ASANA_WORKLOAD_FIELD_GID` variable
+- `ASANA_WORKLOAD_FIELD_GID` variable (optional)
+- `ASANA_TASK_STATUS_FIELD_GID` + `ASANA_TASK_STATUS_VALUE_GID` variables (optional)
 
 Consuming repos just add the tiny caller workflow shown above.
 
@@ -241,7 +295,7 @@ The `ASANA_USER_MAP` organization variable isn't set, or its access scope doesn'
 
 - **Only resolves one parent level.** If a PR links to a sub-subtask, the review lands one step up (under the middle subtask), not at the top-level work item. Extending to full upward traversal is possible but hasn't been needed.
 - **Siblings query is capped at 100.** For parents with more than 100 direct subtasks, we grab the 100th (in Asana's order) as the insert-after target and miss anything beyond. Very rare edge case.
-- **Custom field must be a number.** If your Workload Estimate field is an enum (single-select dropdown) or text, the current implementation will reject the value. To support enums, swap `--argjson` for `--arg` in the payload step and supply the enum option's GID instead of a raw number.
+- **Only number and enum custom fields are supported out of the box.** `workload-*` inputs target a number field; `task-status-*` inputs target an enum (single-select) field. Text, date, multi-enum, and people fields would need additional payload wiring.
 - **Fork PRs cannot use this workflow.** GitHub redacts secrets (including `ASANA_PAT`) when a PR comes from a fork, and the workflow's `GITHUB_TOKEN` is read-only in that context. This is a first-party-repos-only automation by default.
 
 ---
@@ -254,7 +308,7 @@ On a `pull_request: review_requested` event, the reusable workflow runs a single
 2. Extracts the Asana task ID from the PR body via PCRE regex (handles legacy and current URL formats).
 3. Calls `GET /tasks/{id}?opt_fields=parent.gid,parent.name` to find the parent.
 4. Calls `GET /tasks/{target}/subtasks?opt_fields=gid&limit=100` to find the last existing sibling.
-5. Builds the task payload with `jq`, conditionally including assignee and custom field only if present.
+5. Builds the task payload with `jq`, conditionally including assignee and any configured custom fields (workload number, task status enum) only if present.
 6. Calls `POST /tasks/{target}/subtasks` to create the subtask.
 7. Calls `POST /tasks/{new_subtask}/setParent` with `insert_after: <last_sibling>` to move it to the bottom.
 8. Calls `gh pr comment` to drop the Asana link on the PR.
